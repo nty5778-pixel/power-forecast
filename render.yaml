@@ -1,0 +1,22 @@
+# Render Blueprint (순수 파이썬 — DB 미접속이라 Docker/ODBC 불필요)
+# 리포지토리 루트에 두고 "New + > Blueprint" 로 배포하세요.
+services:
+  - type: web
+    name: enertel-forecast-extractor
+    runtime: python
+    plan: starter          # Free 는 유휴 시 슬립(첫 호출 지연). 안정 운영은 Starter 권장
+    healthCheckPath: /health
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ENERTEL_API_TOKEN
+        sync: false          # 대시보드에서 직접 입력(비밀)
+      - key: RUN_API_KEY
+        sync: false          # n8n 호출 인증용 임의 문자열(비밀)
+      - key: NODE
+        value: LZ_HOUSTON
+      - key: ISO
+        value: ERCOT
+      - key: PYTHON_VERSION
+        value: "3.11"

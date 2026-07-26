@@ -1,0 +1,53 @@
+"""
+Enertel 예측 추출 웹서비스 (n8n 에서 호출). DB 에는 접속하지 않고 예측 JSON 만 반환합니다.
+
+엔드포인트:
+    GET  /health                      상태 확인
+    POST /run                         당일(America/Chicago) 예측 JSON 반환
+    POST /run?date=YYYY-MM-DD         특정 as-of 날짜(백필/재실행)
+
+인증:
+    환경변수 RUN_API_KEY 설정 시, 요청 헤더 X-API-Key 가 일치해야 실행됩니다.
+
+응답 예:
+    {"status":"ok","as_of_date":"2026-07-24","node":"LZ_HOUSTON","iso":"ERCOT",
+     "count":96,"da_filled":96,"rt_filled":96,
+     "rows":[{"as_of":"...","target_ts":"...","iso":"ERCOT","node":"LZ_HOUSTON","da":25.08,"rt":26.74}, ...]}
+"""
+
+import datetime
+import os
+
+from fastapi import FastAPI, Header, HTTPException, Query
+
+from pipeline import extract_for_date
+
+app = FastAPI(title="Enertel Forecast Extractor")
+
+
+def _check_key(x_api_key: str | None):
+    key = os.getenv("RUN_API_KEY")
+    if key and x_api_key != key:
+        raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.post("/run")
+def run(date: str | None = Query(default=None, description="as-of 날짜 YYYY-MM-DD (미지정 시 오늘, CT)"),
+        x_api_key: str | None = Header(default=None)):
+    _check_key(x_api_key)
+    d = None
+    if date:
+        try:
+            d = datetime.date.fromisoformat(date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date 형식은 YYYY-MM-DD 여야 합니다")
+    try:
+        result = extract_for_date(d)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
+    return {"status": "ok", **result}
