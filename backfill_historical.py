@@ -14,6 +14,14 @@
   * 모델 선택은 '현재 랭킹 1순위(없으면 차순위, 그래도 없으면 최신 모델)'를 사용합니다.
     (과거 시점의 랭킹이 API로 제공되지 않아, 약간의 look-ahead 가 있음을 감안하세요.)
 
+--lookback N (기본 0):
+  312H(D+4)에 한해, 그날 배치가 아직 없으면 최대 N일 전 배치까지 거슬러 올라가 **빈 칸만** 메꿉니다.
+  아침 7시에 그날 312H 배치가 아직 안 나와 D+4 가 통째로 비는 걸 막는 용도입니다.
+  72H/90H(D+1~D+3)는 이 옵션과 무관하게 **항상 당일 배치만** 씁니다 —
+  전날 72H 는 D+3 을 커버하지도 못하고, 단기 구간은 최신 배치가 훨씬 정확하기 때문입니다.
+  최신 배치 값이 항상 우선이고, 오래된 배치는 절대 덮어쓰지 않습니다.
+  기본 0 이라 과거 백필 결과는 종전과 완전히 동일합니다.
+
 특징: 증분 저장 + 재시작(resume) 지원. 중간에 끊겨도 다시 실행하면 이어서 진행합니다.
 API 호출이 수천 건이라 시간이 걸립니다(수십 분~). --sleep 로 호출 간격 조절 가능.
 
@@ -41,6 +49,12 @@ TARGETS = [
     {"key": "RT_312H", "t": 2631, "series": "RTLMP"},
 ]
 
+# 전날 배치까지 거슬러 올라가도 되는 타깃(= lookback 대상).
+# 72H/90H 는 '당일 07시 배치'가 관건이라 전날 것으로 대체하지 않습니다
+# (전날 72H 는 D+3 을 아예 커버하지 못하고, 단기 구간은 최신 배치가 압도적으로 정확).
+# 312H(D+4)만 전날 최신 배치로 메꿉니다 — 13일치를 예측하므로 D+4 를 그대로 커버합니다.
+LOOKBACK_KEYS = ("DA_312H", "RT_312H")
+
 
 def z(dt):
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -51,13 +65,22 @@ def parse_dt(s):
 
 
 class Extractor:
-    def __init__(self, client, node, sleep=0.15):
+    def __init__(self, client, node, sleep=0.15, lookback_days=0):
         self.c = client
         self.node = node
         self.sleep = sleep
+        # lookback_days=0 이면 모든 타깃이 '그날 생성된 배치'만 사용(기존 백필 동작 그대로).
+        # 1 이상이면 LOOKBACK_KEYS(312H)만 그날 배치가 없을 때 전날(들) 최신 배치로 메꿉니다.
+        # 72H/90H 는 항상 당일 배치만 씁니다.
+        n = max(0, int(lookback_days))
+        self.lookback_days = n
+        self.lookback = {m["key"]: (n if m["key"] in LOOKBACK_KEYS else 0) for m in TARGETS}
+        # 하루에 여러 런이 있을 수 있어 시도 횟수를 제한(API 호출 폭증 방지).
+        self.max_scenarios = {k: (1 if v == 0 else 1 + 3 * v) for k, v in self.lookback.items()}
         self.feat = {}          # target -> feature_id
         self.rank = {}          # target -> [model_id ...] (현재 랭킹 순)
         self.detail_cache = {}  # inference_id -> {ts: p50}
+        self.sources = {}       # target key -> [사용한 배치 정보 ...] (rows_for_day 후 채워짐)
         for m in TARGETS:
             f = self._resolve_feature(m["t"], m["series"])
             self.feat[m["key"]] = f
@@ -86,34 +109,35 @@ class Extractor:
         rk.sort(key=lambda r: r.get("rank", 10**9))
         return [r["model_id"] for r in rk]
 
-    def _choose_scenario(self, target, day):
-        """그날(day) 생성된, D+1~D+4 구간을 커버하는 최신 배치."""
+    def _scenarios_for(self, target, day, lookback):
+        """
+        D+1~D+4 구간을 커버하는 배치 중, [day - lookback, day] 에 생성된 것들을
+        최신순으로 반환합니다. (lookback=0 이면 그날 것만)
+
+        반환: [(생성일(Central date), scenario), ...]
+        """
         start = datetime.combine(day + timedelta(days=1), time(0), CENTRAL)
         end = datetime.combine(day + timedelta(days=5), time(0), CENTRAL)
         try:
             scs = self.c.get_scenarios(target, start=z(start), end=z(end), limit=500)
         except EnertelAPIError:
-            return None
+            return []
         self._nap()
+        oldest = day - timedelta(days=lookback)
         cand = []
         for s in scs or []:
             sa = s.get("scheduled_at")
             if not sa:
                 continue
-            if parse_dt(sa).astimezone(CENTRAL).date() == day:
-                cand.append(s)
-        if not cand:
-            return None
-        cand.sort(key=lambda s: s["scheduled_at"])
-        return cand[-1]  # 그날의 최신 런
+            d0 = parse_dt(sa).astimezone(CENTRAL).date()
+            if oldest <= d0 <= day:
+                cand.append((sa, d0, s))
+        cand.sort(key=lambda x: x[0], reverse=True)   # 최신 런 우선
+        return [(d0, s) for (_sa, d0, s) in cand]
 
-    def _series_map(self, key, target, day):
+    def _map_for_scenario(self, key, s):
+        """배치 하나에서 {timestamp: p50} 추출 (inference_id 단위 캐시)."""
         feat = self.feat[key]
-        if feat is None:
-            return {}
-        s = self._choose_scenario(target, day)
-        if s is None:
-            return {}
         if s["id"] in self.detail_cache:
             return self.detail_cache[s["id"]]
         try:
@@ -145,8 +169,55 @@ class Extractor:
         self.detail_cache[s["id"]] = m
         return m
 
+    def _series_map(self, key, target, day, need=None):
+        """
+        최신 배치부터 순서대로 읽어 {timestamp: p50} 를 만듭니다.
+        필요한 시각(need)이 다 채워지면 멈추고, 모자라면 더 오래된 배치로 **빈 칸만** 메꿉니다.
+        (새 배치 값이 항상 우선 — 오래된 배치는 덮어쓰지 않습니다)
+
+        거슬러 올라가는 범위는 타깃별로 다릅니다: 72H/90H 는 항상 당일만, 312H 만 lookback 적용.
+        """
+        feat = self.feat[key]
+        if feat is None:
+            self.sources[key] = []
+            return {}
+        merged = {}
+        used = []
+        scens = self._scenarios_for(target, day, self.lookback[key])
+        for (sday, s) in scens[: self.max_scenarios[key]]:
+            m = self._map_for_scenario(key, s)
+            added = 0
+            for ts, v in m.items():
+                if ts not in merged:
+                    merged[ts] = v
+                    added += 1
+            if added:
+                used.append({
+                    "scenario_id": s.get("id"),
+                    "scenario_date": sday.isoformat(),
+                    "stale_days": (day - sday).days,
+                    "values": added,
+                })
+            if need is not None:
+                if need <= merged.keys():   # 필요한 시각이 전부 채워짐
+                    break
+            elif merged:
+                break
+        self.sources[key] = used
+        return merged
+
     def rows_for_day(self, day):
-        maps = {m["key"]: self._series_map(m["key"], m["t"], day) for m in TARGETS}
+        def hours(dd):
+            return {datetime.combine(day + timedelta(days=dd), time(h), CENTRAL).isoformat()
+                    for h in range(24)}
+
+        near = hours(1) | hours(2) | hours(3)   # 72H/90H 가 담당 (당일 배치만)
+        far = hours(4)                          # 312H 가 담당 (없으면 전날 배치)
+        need = {"DA_72H": near, "RT_90H": near, "DA_312H": far, "RT_312H": far}
+
+        self.sources = {}
+        maps = {m["key"]: self._series_map(m["key"], m["t"], day, need[m["key"]])
+                for m in TARGETS}
         asof = datetime.combine(day, time(7), CENTRAL).isoformat()
         out = []
         for dd in range(1, 5):
@@ -169,6 +240,8 @@ def main():
     ap.add_argument("--end", default=None, help="기본: 오늘")
     ap.add_argument("--out", default="LZ_HOUSTON_historical_asof07.csv")
     ap.add_argument("--sleep", type=float, default=0.15, help="API 호출 간 대기(초)")
+    ap.add_argument("--lookback", type=int, default=0,
+                    help="그날 배치가 없을 때 며칠 전 배치까지 대신 쓸지 (기본 0 = 그날 것만)")
     args = ap.parse_args()
 
     try:
@@ -187,7 +260,7 @@ def main():
             resume_from = date.fromisoformat(f.read().strip())
         print(f"이어서 진행: {resume_from} 다음 날짜부터")
 
-    ex = Extractor(client, args.node, sleep=args.sleep)
+    ex = Extractor(client, args.node, sleep=args.sleep, lookback_days=args.lookback)
 
     new_file = not (os.path.exists(args.out) and resume_from)
     f = open(args.out, "a", newline="", encoding="utf-8-sig")
@@ -211,7 +284,9 @@ def main():
         done += 1
         da_n = sum(1 for r in rows if r[2] != "")
         rt_n = sum(1 for r in rows if r[3] != "")
-        print(f"[{done}/{total}] {d}  DA {da_n}/96  RT {rt_n}/96")
+        stale = [u["stale_days"] for lst in ex.sources.values() for u in lst if u["stale_days"] > 0]
+        tag = f"  (이전 배치 사용: -{max(stale)}d)" if stale else ""
+        print(f"[{done}/{total}] {d}  DA {da_n}/96  RT {rt_n}/96{tag}")
         d += timedelta(days=1)
 
     f.close()

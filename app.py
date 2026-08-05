@@ -5,6 +5,7 @@ Enertel 예측 추출 웹서비스 (n8n 에서 호출). DB 에는 접속하지 �
     GET  /health                      상태 확인
     POST /run                         당일(America/Chicago) 예측 JSON 반환
     POST /run?date=YYYY-MM-DD         특정 as-of 날짜(백필/재실행)
+    POST /run?lookback=0              그날 배치만 사용(환경변수 LOOKBACK_DAYS 무시, 테스트용)
 
 인증:
     환경변수 RUN_API_KEY 설정 시, 요청 헤더 X-API-Key 가 일치해야 실행됩니다.
@@ -12,6 +13,8 @@ Enertel 예측 추출 웹서비스 (n8n 에서 호출). DB 에는 접속하지 �
 응답 예:
     {"status":"ok","as_of_date":"2026-07-24","node":"LZ_HOUSTON","iso":"ERCOT",
      "count":96,"da_filled":96,"rt_filled":96,
+     "by_horizon":{"D+1":{"da":24,"rt":24}, ...},
+     "lookback_days":1,"max_stale_days":0,"sources":{...},
      "rows":[{"as_of":"...","target_ts":"...","iso":"ERCOT","node":"LZ_HOUSTON","da":25.08,"rt":26.74}, ...]}
 """
 
@@ -38,6 +41,8 @@ def health():
 
 @app.post("/run")
 def run(date: str | None = Query(default=None, description="as-of 날짜 YYYY-MM-DD (미지정 시 오늘, CT)"),
+        lookback: int | None = Query(default=None, ge=0, le=7,
+                                     description="그날 배치가 없을 때 며칠 전 배치까지 쓸지 (미지정 시 LOOKBACK_DAYS)"),
         x_api_key: str | None = Header(default=None)):
     _check_key(x_api_key)
     d = None
@@ -47,7 +52,7 @@ def run(date: str | None = Query(default=None, description="as-of 날짜 YYYY-MM
         except ValueError:
             raise HTTPException(status_code=400, detail="date 형식은 YYYY-MM-DD 여야 합니다")
     try:
-        result = extract_for_date(d)
+        result = extract_for_date(d, lookback=lookback)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
     return {"status": "ok", **result}
