@@ -105,3 +105,78 @@ def extract_for_date(d: date | None = None, lookback: int | None = None) -> dict
         "sources": sources,            # 타깃별로 실제 사용한 배치(id/생성일/채운 값 수)
         "rows": rows,
     }
+
+
+def extract_full_for_date(d: date | None = None, lookback: int | None = None) -> dict:
+    """
+    extract_for_date 와 같은 배치/블렌딩 규칙으로, P50 뿐 아니라 **모든 백분위**를 반환합니다.
+    (구글 시트 전용 n8n 워크플로에서 사용. 기존 /run · DB 적재와는 무관)
+
+    환경변수 ENERTEL_ATTRIBUTES (선택): 요청할 백분위 목록, 예 "p10,p25,p50,p75,p90".
+      비워두면 attributes 필터 없이 요청해 API 가 주는 p* 값을 전부 씁니다.
+
+    rows 한 행 = 한 시간:
+      {"key","as_of","forecastdate","time_start","time_end","iso","node",
+       "da_p10",...,"da_p90","rt_p10",...,"rt_p90"}
+    """
+    node = os.getenv("NODE", "LZ_HOUSTON")
+    iso = os.getenv("ISO", "ERCOT")
+    if d is None:
+        d = datetime.now(CENTRAL).date()
+    if lookback is None:
+        lookback = int(os.getenv("LOOKBACK_DAYS", "1"))
+    attributes = os.getenv("ENERTEL_ATTRIBUTES") or None
+
+    client = EnertelClient()
+    ex = Extractor(client, node, sleep=float(os.getenv("SLEEP", "0.15")),
+                   lookback_days=lookback, full=True, attributes=attributes)
+    raw = ex.rows_for_day(d)  # [[as_of, target_ts, {pXX: v} | "", {pXX: v} | ""], ...]
+
+    pcts = sorted({k for (_a, _t, da, rt) in raw for m in (da, rt) if m for k in m},
+                  key=lambda k: int(k[1:]))
+    cols = [f"da_{p}" for p in pcts] + [f"rt_{p}" for p in pcts]
+
+    rows = []
+    for (a, t, da, rt) in raw:
+        as_of_date, forecastdate, time_start, time_end = _split_ts(a, t)
+        row = {
+            "key": f"{as_of_date}|{forecastdate}|{time_start}|{node}",
+            "as_of": as_of_date,
+            "forecastdate": forecastdate,
+            "time_start": time_start,
+            "time_end": time_end,
+            "iso": iso,
+            "node": node,
+        }
+        for p in pcts:
+            row[f"da_{p}"] = (da or {}).get(p)
+        for p in pcts:
+            row[f"rt_{p}"] = (rt or {}).get(p)
+        rows.append(row)
+
+    by_horizon = {}
+    for i in range(1, 5):
+        fd = (d + timedelta(days=i)).isoformat()
+        sub = [r for r in rows if r["forecastdate"] == fd]
+        by_horizon[f"D+{i}"] = {
+            "forecastdate": fd,
+            "da": sum(1 for r in sub if any(r[c] is not None for c in cols if c.startswith("da_"))),
+            "rt": sum(1 for r in sub if any(r[c] is not None for c in cols if c.startswith("rt_"))),
+        }
+
+    sources = getattr(ex, "sources", {}) or {}
+    max_stale = max((u["stale_days"] for lst in sources.values() for u in lst), default=0)
+
+    return {
+        "as_of_date": d.isoformat(),
+        "node": node,
+        "iso": iso,
+        "percentiles": pcts,           # 실제로 받은 백분위 목록
+        "columns": cols,
+        "count": len(rows),
+        "by_horizon": by_horizon,
+        "lookback_days": lookback,
+        "max_stale_days": max_stale,
+        "sources": sources,
+        "rows": rows,
+    }

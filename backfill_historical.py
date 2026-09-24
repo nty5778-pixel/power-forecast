@@ -33,6 +33,7 @@ API 호출이 수천 건이라 시간이 걸립니다(수십 분~). --sleep 로 
 import argparse
 import csv
 import os
+import re
 import time as _time
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -55,6 +56,9 @@ TARGETS = [
 # 312H(D+4)만 전날 최신 배치로 메꿉니다 — 13일치를 예측하므로 D+4 를 그대로 커버합니다.
 LOOKBACK_KEYS = ("DA_312H", "RT_312H")
 
+# full=True 모드에서 백분위로 인정할 속성 이름 (p1, p05, p10, p50, p90, p99 ...)
+PCT_RE = re.compile(r"^p\d{1,2}$")
+
 
 def z(dt):
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -65,23 +69,36 @@ def parse_dt(s):
 
 
 class Extractor:
-    def __init__(self, client, node, sleep=0.15, lookback_days=0):
+    def __init__(self, client, node, sleep=0.15, lookback_days=0,
+                 cutoff_hour=None, keys=None, full=False, attributes=None):
         self.c = client
         self.node = node
         self.sleep = sleep
+        # full=False: 기존 동작 그대로 {ts: p50(float)}.
+        # full=True : 모든 백분위 {ts: {"p10": .., "p50": .., ...}}.
+        #   attributes 를 주면 그 목록만 요청(예: "p10,p25,p50,p75,p90"),
+        #   None 이면 attributes 필터 없이 요청해 응답에 담긴 p* 키를 전부 씁니다.
+        self.full = full
+        self.attributes = attributes
+        # cutoff_hour: 그날 이 시각(Central) '이전에 생성된' 배치만 사용합니다.
+        #   과거 백필에서 as_of 07 시 시점을 그대로 재현할 때 씁니다(7 지정).
+        #   None 이면 제한 없음 — 실서비스는 어차피 그 시각에 도는 것이라 불필요합니다.
+        self.cutoff_hour = cutoff_hour
+        # keys: 일부 타깃만 쓰고 싶을 때(예: D+4 만 백필 → 312H 두 개). None 이면 전부.
+        self.targets = [m for m in TARGETS if keys is None or m["key"] in keys]
         # lookback_days=0 이면 모든 타깃이 '그날 생성된 배치'만 사용(기존 백필 동작 그대로).
         # 1 이상이면 LOOKBACK_KEYS(312H)만 그날 배치가 없을 때 전날(들) 최신 배치로 메꿉니다.
         # 72H/90H 는 항상 당일 배치만 씁니다.
         n = max(0, int(lookback_days))
         self.lookback_days = n
-        self.lookback = {m["key"]: (n if m["key"] in LOOKBACK_KEYS else 0) for m in TARGETS}
+        self.lookback = {m["key"]: (n if m["key"] in LOOKBACK_KEYS else 0) for m in self.targets}
         # 하루에 여러 런이 있을 수 있어 시도 횟수를 제한(API 호출 폭증 방지).
         self.max_scenarios = {k: (1 if v == 0 else 1 + 3 * v) for k, v in self.lookback.items()}
         self.feat = {}          # target -> feature_id
         self.rank = {}          # target -> [model_id ...] (현재 랭킹 순)
         self.detail_cache = {}  # inference_id -> {ts: p50}
         self.sources = {}       # target key -> [사용한 배치 정보 ...] (rows_for_day 후 채워짐)
-        for m in TARGETS:
+        for m in self.targets:
             f = self._resolve_feature(m["t"], m["series"])
             self.feat[m["key"]] = f
             self.rank[m["key"]] = self._rankings(m["t"], f) if f else []
@@ -124,12 +141,17 @@ class Extractor:
             return []
         self._nap()
         oldest = day - timedelta(days=lookback)
+        cutoff = (datetime.combine(day, time(self.cutoff_hour), CENTRAL)
+                  if self.cutoff_hour is not None else None)
         cand = []
         for s in scs or []:
             sa = s.get("scheduled_at")
             if not sa:
                 continue
-            d0 = parse_dt(sa).astimezone(CENTRAL).date()
+            sadt = parse_dt(sa)
+            if cutoff is not None and sadt > cutoff:
+                continue        # as_of 시점엔 아직 없던 배치 — 과거 재현 시 제외
+            d0 = sadt.astimezone(CENTRAL).date()
             if oldest <= d0 <= day:
                 cand.append((sa, d0, s))
         cand.sort(key=lambda x: x[0], reverse=True)   # 최신 런 우선
@@ -156,13 +178,24 @@ class Extractor:
         # (일부 과거 배치는 1순위 모델 inference 에 해당 feature 가 없을 수 있음)
         m = {}
         for pick in candidates[:5]:
+            attrs = self.attributes if self.full else "p50"
             try:
-                det = self.c.get_inference_detail(pick["id"], attributes="p50", feature_ids=str(feat))
+                det = self.c.get_inference_detail(pick["id"], attributes=attrs, feature_ids=str(feat))
             except EnertelAPIError:
                 det = []
             self._nap()
-            mm = {r["timestamp"]: round(r["p50"], 2)
-                  for r in det if r.get("feature_id") == feat and r.get("p50") is not None}
+            if self.full:
+                mm = {}
+                for r in det:
+                    if r.get("feature_id") != feat:
+                        continue
+                    pv = {k: round(v, 2) for k, v in r.items()
+                          if PCT_RE.match(k) and isinstance(v, (int, float))}
+                    if pv:
+                        mm[r["timestamp"]] = pv
+            else:
+                mm = {r["timestamp"]: round(r["p50"], 2)
+                      for r in det if r.get("feature_id") == feat and r.get("p50") is not None}
             if mm:
                 m = mm
                 break
@@ -206,29 +239,33 @@ class Extractor:
         self.sources[key] = used
         return merged
 
-    def rows_for_day(self, day):
+    def rows_for_day(self, day, horizons=(1, 2, 3, 4)):
+        """
+        horizons: 뽑을 D+n 목록. (1,2,3,4)=96행이 기본, (4,)=D+4 24행만(백필용).
+        """
         def hours(dd):
             return {datetime.combine(day + timedelta(days=dd), time(h), CENTRAL).isoformat()
                     for h in range(24)}
 
-        near = hours(1) | hours(2) | hours(3)   # 72H/90H 가 담당 (당일 배치만)
-        far = hours(4)                          # 312H 가 담당 (없으면 전날 배치)
+        hs = tuple(horizons)
+        near = set().union(*[hours(dd) for dd in hs if dd <= 3]) if any(d <= 3 for d in hs) else set()
+        far = hours(4) if 4 in hs else set()
         need = {"DA_72H": near, "RT_90H": near, "DA_312H": far, "RT_312H": far}
 
         self.sources = {}
         maps = {m["key"]: self._series_map(m["key"], m["t"], day, need[m["key"]])
-                for m in TARGETS}
+                for m in self.targets}
         asof = datetime.combine(day, time(7), CENTRAL).isoformat()
         out = []
-        for dd in range(1, 5):
+        for dd in hs:
             for h in range(24):
                 ts = datetime.combine(day + timedelta(days=dd), time(h), CENTRAL).isoformat()
                 if dd <= 3:
-                    da = maps["DA_72H"].get(ts, "")
-                    rt = maps["RT_90H"].get(ts, "")
+                    da = maps.get("DA_72H", {}).get(ts, "")
+                    rt = maps.get("RT_90H", {}).get(ts, "")
                 else:
-                    da = maps["DA_312H"].get(ts, "")
-                    rt = maps["RT_312H"].get(ts, "")
+                    da = maps.get("DA_312H", {}).get(ts, "")
+                    rt = maps.get("RT_312H", {}).get(ts, "")
                 out.append([asof, ts, da, rt])
         return out
 
