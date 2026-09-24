@@ -26,7 +26,10 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from enertel_client import EnertelClient
-from backfill_historical import Extractor
+from backfill_historical import Extractor, MODEL_KEYS
+
+# model 지정 시 뽑는 구간: 72H 는 D+3 까지만 예측, 312H 는 D+4 까지.
+MODEL_HORIZONS = {"72H": (1, 2, 3), "312H": (1, 2, 3, 4)}
 
 CENTRAL = ZoneInfo("America/Chicago")
 
@@ -108,13 +111,15 @@ def extract_for_date(d: date | None = None, lookback: int | None = None) -> dict
 
 
 def extract_full_for_date(d: date | None = None, lookback: int | None = None,
-                          cutoff_hour: int | None = None) -> dict:
+                          cutoff_hour: int | None = None, model: str | None = None) -> dict:
     """
     extract_for_date 와 같은 배치/블렌딩 규칙으로, P50 뿐 아니라 **모든 백분위**를 반환합니다.
     (구글 시트 전용 n8n 워크플로에서 사용. 기존 /run · DB 적재와는 무관)
 
     환경변수 ENERTEL_ATTRIBUTES (선택): 요청할 백분위 목록, 예 "p10,p25,p50,p75,p90".
       비워두면 attributes 필터 없이 요청해 API 가 주는 p* 값을 전부 씁니다.
+
+    model (선택): None=기존 블렌딩, "72H"=DA_72H/RT_90H 로 D+1~3, "312H"=DA_312H/RT_312H 로 D+1~4.
 
     rows 한 행 = 한 시간:
       {"key","as_of","forecastdate","time_start","time_end","iso","node",
@@ -129,10 +134,12 @@ def extract_full_for_date(d: date | None = None, lookback: int | None = None,
     attributes = os.getenv("ENERTEL_ATTRIBUTES") or None
 
     client = EnertelClient()
+    keys = MODEL_KEYS[model] if model else None
+    horizons = MODEL_HORIZONS[model] if model else (1, 2, 3, 4)
     ex = Extractor(client, node, sleep=float(os.getenv("SLEEP", "0.15")),
                    lookback_days=lookback, full=True, attributes=attributes,
-                   cutoff_hour=cutoff_hour)
-    raw = ex.rows_for_day(d)  # [[as_of, target_ts, {pXX: v} | "", {pXX: v} | ""], ...]
+                   cutoff_hour=cutoff_hour, keys=keys)
+    raw = ex.rows_for_day(d, horizons=horizons, model=model)  # [[as_of, target_ts, {pXX: v} | "", {pXX: v} | ""], ...]
 
     pcts = sorted({k for (_a, _t, da, rt) in raw for m in (da, rt) if m for k in m},
                   key=lambda k: int(k[1:]))
@@ -173,6 +180,7 @@ def extract_full_for_date(d: date | None = None, lookback: int | None = None,
         "as_of_date": d.isoformat(),
         "node": node,
         "iso": iso,
+        "model": model or "blend",
         "percentiles": pcts,           # 실제로 받은 백분위 목록
         "columns": cols,
         "count": len(rows),

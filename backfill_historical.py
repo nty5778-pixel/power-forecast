@@ -56,6 +56,10 @@ TARGETS = [
 # 312H(D+4)만 전날 최신 배치로 메꿉니다 — 13일치를 예측하므로 D+4 를 그대로 커버합니다.
 LOOKBACK_KEYS = ("DA_312H", "RT_312H")
 
+# rows_for_day(model=...) 로 한 모델만 뽑을 때 쓰는 (DA 타깃, RT 타깃).
+# 블렌딩 없이 그 모델 값으로 전 구간(horizons)을 채웁니다.
+MODEL_KEYS = {"72H": ("DA_72H", "RT_90H"), "312H": ("DA_312H", "RT_312H")}
+
 # full=True 모드에서 백분위로 인정할 속성 이름 (p1, p05, p10, p50, p90, p99 ...)
 PCT_RE = re.compile(r"^p\d{1,2}$")
 
@@ -239,18 +243,25 @@ class Extractor:
         self.sources[key] = used
         return merged
 
-    def rows_for_day(self, day, horizons=(1, 2, 3, 4)):
+    def rows_for_day(self, day, horizons=(1, 2, 3, 4), model=None):
         """
         horizons: 뽑을 D+n 목록. (1,2,3,4)=96행이 기본, (4,)=D+4 24행만(백필용).
+        model   : None 이면 기존 블렌딩(D+1~3=72H/90H, D+4=312H).
+                  "72H" / "312H" 이면 그 모델 하나로 horizons 전 구간을 채웁니다(MODEL_KEYS).
         """
         def hours(dd):
             return {datetime.combine(day + timedelta(days=dd), time(h), CENTRAL).isoformat()
                     for h in range(24)}
 
         hs = tuple(horizons)
-        near = set().union(*[hours(dd) for dd in hs if dd <= 3]) if any(d <= 3 for d in hs) else set()
-        far = hours(4) if 4 in hs else set()
-        need = {"DA_72H": near, "RT_90H": near, "DA_312H": far, "RT_312H": far}
+        if model is None:
+            near = set().union(*[hours(dd) for dd in hs if dd <= 3]) if any(d <= 3 for d in hs) else set()
+            far = hours(4) if 4 in hs else set()
+            need = {"DA_72H": near, "RT_90H": near, "DA_312H": far, "RT_312H": far}
+        else:
+            dk, rk = MODEL_KEYS[model]
+            allh = set().union(*[hours(dd) for dd in hs])
+            need = {k: (allh if k in (dk, rk) else set()) for k in ("DA_72H", "RT_90H", "DA_312H", "RT_312H")}
 
         self.sources = {}
         maps = {m["key"]: self._series_map(m["key"], m["t"], day, need[m["key"]])
@@ -260,7 +271,10 @@ class Extractor:
         for dd in hs:
             for h in range(24):
                 ts = datetime.combine(day + timedelta(days=dd), time(h), CENTRAL).isoformat()
-                if dd <= 3:
+                if model is not None:
+                    da = maps.get(dk, {}).get(ts, "")
+                    rt = maps.get(rk, {}).get(ts, "")
+                elif dd <= 3:
                     da = maps.get("DA_72H", {}).get(ts, "")
                     rt = maps.get("RT_90H", {}).get(ts, "")
                 else:
