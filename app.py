@@ -64,6 +64,8 @@ def run(date: str | None = Query(default=None, description="as-of 날짜 YYYY-MM
 def run_full(date: str | None = Query(default=None, description="as-of 날짜 YYYY-MM-DD (미지정 시 오늘, CT)"),
              lookback: int | None = Query(default=None, ge=0, le=7,
                                           description="312H(D+4) 전날 배치 대체 일수 (미지정 시 LOOKBACK_DAYS)"),
+             cutoff: int | None = Query(default=None, ge=0, le=23,
+                                        description="그날 이 시각(CT) 이전에 생성된 배치만 사용 — 과거 백필에서 07시 시점 재현용"),
              x_api_key: str | None = Header(default=None)):
     """/run 과 같은 규칙으로 모든 백분위(da_pXX / rt_pXX)를 반환. 구글 시트 전용 워크플로에서 호출."""
     _check_key(x_api_key)
@@ -74,7 +76,7 @@ def run_full(date: str | None = Query(default=None, description="as-of 날짜 YY
         except ValueError:
             raise HTTPException(status_code=400, detail="date 형식은 YYYY-MM-DD 여야 합니다")
     try:
-        result = extract_full_for_date(d, lookback=lookback)
+        result = extract_full_for_date(d, lookback=lookback, cutoff_hour=cutoff)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
     return {"status": "ok", **result}

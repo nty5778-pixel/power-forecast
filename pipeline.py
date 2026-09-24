@@ -107,7 +107,8 @@ def extract_for_date(d: date | None = None, lookback: int | None = None) -> dict
     }
 
 
-def extract_full_for_date(d: date | None = None, lookback: int | None = None) -> dict:
+def extract_full_for_date(d: date | None = None, lookback: int | None = None,
+                          cutoff_hour: int | None = None) -> dict:
     """
     extract_for_date 와 같은 배치/블렌딩 규칙으로, P50 뿐 아니라 **모든 백분위**를 반환합니다.
     (구글 시트 전용 n8n 워크플로에서 사용. 기존 /run · DB 적재와는 무관)
@@ -129,7 +130,8 @@ def extract_full_for_date(d: date | None = None, lookback: int | None = None) ->
 
     client = EnertelClient()
     ex = Extractor(client, node, sleep=float(os.getenv("SLEEP", "0.15")),
-                   lookback_days=lookback, full=True, attributes=attributes)
+                   lookback_days=lookback, full=True, attributes=attributes,
+                   cutoff_hour=cutoff_hour)
     raw = ex.rows_for_day(d)  # [[as_of, target_ts, {pXX: v} | "", {pXX: v} | ""], ...]
 
     pcts = sorted({k for (_a, _t, da, rt) in raw for m in (da, rt) if m for k in m},
